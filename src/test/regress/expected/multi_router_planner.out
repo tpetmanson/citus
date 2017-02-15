@@ -1826,6 +1826,12 @@ FETCH test_cursor; -- fetch one row after the last
 ----+-----------+-------+------------
 (0 rows)
 
+FETCH BACKWARD test_cursor;
+ id | author_id |  title   | word_count 
+----+-----------+----------+------------
+ 41 |         1 | aznavour |      11814
+(1 row)
+
 END;
 -- queries inside copy can be router plannable
 COPY (

@@ -360,7 +360,7 @@ EXPLAIN (COSTS FALSE, VERBOSE TRUE)
 	HAVING sum(l_quantity) > 100;
 Aggregate
   Output: (sum("?column?") / (sum("?column?_1") / sum("?column?_2")))
-  Filter: (sum("remote scan".worker_column_4) > '100'::numeric)
+  Filter: (sum(remote_scan.worker_column_4) > '100'::numeric)
   ->  Custom Scan (CitusScan)
         Output: "?column?", "?column?_1", "?column?_2", worker_column_4
         Executor: Real-Time
@@ -379,8 +379,8 @@ EXPLAIN (COSTS FALSE, VERBOSE TRUE)
 	HAVING l_quantity > (100 * random());
 HashAggregate
   Output: l_quantity
-  Group Key: "remote scan".l_quantity
-  Filter: (("remote scan".worker_column_2)::double precision > ('100'::double precision * random()))
+  Group Key: remote_scan.l_quantity
+  Filter: ((remote_scan.worker_column_2)::double precision > ('100'::double precision * random()))
   ->  Custom Scan (CitusScan)
         Output: l_quantity, worker_column_2
         Executor: Real-Time

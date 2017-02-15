@@ -1312,6 +1312,12 @@ FETCH test_cursor;
  11 |         1 | alamo |       1347
 (1 row)
 
+FETCH BACKWARD test_cursor;
+ id | author_id |  title   | word_count 
+----+-----------+----------+------------
+  1 |         1 | arsenous |       9572
+(1 row)
+
 END;
 -- queries inside copy can be router plannable
 COPY (

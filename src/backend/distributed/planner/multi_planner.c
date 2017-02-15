@@ -23,24 +23,27 @@
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_master_planner.h"
 #include "distributed/multi_router_planner.h"
-
 #include "executor/executor.h"
-
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-
 #include "optimizer/planner.h"
-
 #include "utils/memutils.h"
 
 
 static List *relationRestrictionContextList = NIL;
+static CustomScanMethods CitusCustomScanMethods = {
+	"CitusScan",
+	CitusCreateScan
+};
 
 
 /* local function forward declarations */
+static PlannedStmt * CreateRealTimeFinalPlan(PlannedStmt *localPlan, MultiPlan *multiPlan,
+											 CustomScan *customScan);
+static PlannedStmt * CreateRouterFinalPlan(PlannedStmt *localPlan, MultiPlan *multiPlan,
+										   CustomScan *customScan);
 static void CheckNodeIsDumpable(Node *node);
-static PlannedStmt * MultiQueryContainerNode(PlannedStmt *result,
-											 struct MultiPlan *multiPlan);
+static PlannedStmt * CreateFinalPlan(PlannedStmt *localPlan, MultiPlan *multiPlan);
 static struct PlannedStmt * CreateDistributedPlan(PlannedStmt *localPlan,
 												  Query *originalQuery,
 												  Query *query,
@@ -274,8 +277,8 @@ CreateDistributedPlan(PlannedStmt *localPlan, Query *originalQuery, Query *query
 		RaiseDeferredError(distributedPlan->planningError, ERROR);
 	}
 
-	/* store required data into the planned statement */
-	resultPlan = MultiQueryContainerNode(localPlan, distributedPlan);
+	/* create final plan by combining local plan with distributed plan */
+	resultPlan = CreateFinalPlan(localPlan, distributedPlan);
 
 	/*
 	 * As explained above, force planning costs to be unrealistically high if
@@ -292,12 +295,6 @@ CreateDistributedPlan(PlannedStmt *localPlan, Query *originalQuery, Query *query
 
 	return resultPlan;
 }
-
-
-static CustomScanMethods CitusCustomScanMethods = {
-	"CitusScan",
-	CitusCreateScan
-};
 
 
 /*
@@ -318,31 +315,25 @@ GetMultiPlan(CustomScan *customScan)
 }
 
 
-/* Does the passed in statement require distributed execution? */
-bool
-HasCitusToplevelNode(PlannedStmt *result)
-{
-	elog(ERROR, "gone");
-}
-
-
+/*
+ * SerializeMultiPlan returns the string representing the distributed plan.
+ *
+ * FIXME: This should be improved for 9.6+, we we can copy trees efficiently.
+ * I.e. we should introduce copy support for relevant node types, and just
+ * return the MultiPlan as-is for 9.6.
+ */
 Node *
-SerializableMultiPlan(MultiPlan *multiPlan)
+SerializeMultiPlan(MultiPlan *multiPlan)
 {
-	/*
-	 * FIXME: This should be improved for 9.6+, we we can copy trees
-	 * efficiently. I.e. we should introduce copy support for relevant node
-	 * types, and just return the MultiPlan as-is for 9.6.
-	 */
-	char *serializedPlan = NULL;
+	char *serializedMultiPlan = NULL;
 	Const *multiPlanData = NULL;
 
-	serializedPlan = CitusNodeToString(multiPlan);
+	serializedMultiPlan = CitusNodeToString(multiPlan);
 
 	multiPlanData = makeNode(Const);
 	multiPlanData->consttype = CSTRINGOID;
-	multiPlanData->constlen = strlen(serializedPlan);
-	multiPlanData->constvalue = CStringGetDatum(serializedPlan);
+	multiPlanData->constlen = strlen(serializedMultiPlan);
+	multiPlanData->constvalue = CStringGetDatum(serializedMultiPlan);
 	multiPlanData->constbyval = false;
 	multiPlanData->location = -1;
 
@@ -350,6 +341,10 @@ SerializableMultiPlan(MultiPlan *multiPlan)
 }
 
 
+/*
+ * DeSerializeMultiPlan returns the deserialized distributed plan from the string
+ * representation in a Const node.
+ */
 MultiPlan *
 DeSerializeMultiPlan(Node *node)
 {
@@ -369,107 +364,117 @@ DeSerializeMultiPlan(Node *node)
 
 
 /*
- * CreateCitusToplevelNode creates the top-level planTree node for a
- * distributed statement. That top-level node is a) recognizable by the
- * executor hooks, allowing them to redirect execution, b) contains the
- * parameters required for distributed execution.
- *
- * The exact representation of the top-level node is an implementation detail
- * which should not be referred to outside this file, as it's likely to become
- * version dependant. Use GetMultiPlan() and HasCitusToplevelNode() to access.
- *
- * FIXME
- *
- * Internally the data is stored as arguments to a 'citus_extradata_container'
- * function, which has to be removed from the really executed plan tree before
- * query execution.
+ * CreateFinalPlan combines local plan with distributed plan and creates a plan
+ * which can be run by the PostgreSQL executor.
  */
-PlannedStmt *
-MultiQueryContainerNode(PlannedStmt *originalPlan, MultiPlan *multiPlan)
+static PlannedStmt *
+CreateFinalPlan(PlannedStmt *localPlan, MultiPlan *multiPlan)
 {
-	PlannedStmt *resultPlan = NULL;
+	PlannedStmt *finalPlan = NULL;
 	CustomScan *customScan = makeNode(CustomScan);
-	Node *multiPlanData = SerializableMultiPlan(multiPlan);
+	Node *multiPlanData = SerializeMultiPlan(multiPlan);
 
 	customScan->methods = &CitusCustomScanMethods;
 	customScan->custom_private = list_make1(multiPlanData);
+	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
 
-	/* FIXME: This probably ain't correct */
-	if (ExecSupportsBackwardScan(originalPlan->planTree))
-	{
-		customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
-	}
-
-	/*
-	 * FIXME: these two branches/pieces of code should probably be moved into
-	 * router / logical planner code respectively.
-	 */
+	/* check if we have a master query */
 	if (multiPlan->masterQuery)
 	{
-		resultPlan = MasterNodeSelectPlan(multiPlan, customScan);
-		resultPlan->queryId = originalPlan->queryId;
-		resultPlan->utilityStmt = originalPlan->utilityStmt;
+		finalPlan = CreateRealTimeFinalPlan(localPlan, multiPlan, customScan);
 	}
 	else
 	{
-		ListCell *lc = NULL;
-		List *targetList = NIL;
-		bool foundJunk = false;
-		RangeTblEntry *rangeTableEntry = NULL;
-		List *columnNames = NIL;
-		int newRTI = list_length(originalPlan->rtable) + 1;
-
-		/*
-		 * XXX: This basically just builds a targetlist to "read" from the
-		 * custom scan output.
-		 */
-		foreach(lc, originalPlan->planTree->targetlist)
-		{
-			TargetEntry *te = lfirst(lc);
-			Var *newVar = NULL;
-			TargetEntry *newTargetEntry = NULL;
-
-			Assert(IsA(te, TargetEntry));
-
-			/*
-			 * XXX: I can't think of a case where we'd need resjunk stuff at
-			 * the toplevel of a router query - all things needing it have
-			 * been pushed down.
-			 */
-			if (te->resjunk)
-			{
-				foundJunk = true;
-				continue;
-			}
-
-			if (foundJunk)
-			{
-				ereport(ERROR, (errmsg("unexpected !junk entry after resjunk entry")));
-			}
-
-			/* build TE pointing to custom scan */
-			newVar = makeVarFromTargetEntry(newRTI, te);
-			newTargetEntry = flatCopyTargetEntry(te);
-			newTargetEntry->expr = (Expr *) newVar;
-			targetList = lappend(targetList, newTargetEntry);
-
-			columnNames = lappend(columnNames, makeString(te->resname));
-		}
-
-		/* XXX: can't think of a better RTE type than VALUES */
-		rangeTableEntry = makeNode(RangeTblEntry);
-		rangeTableEntry->rtekind = RTE_VALUES; /* can't look up relation */
-		rangeTableEntry->eref = makeAlias("remote_scan", columnNames);
-		rangeTableEntry->inh = false;
-		rangeTableEntry->inFromCl = true;
-
-		resultPlan = originalPlan;
-		resultPlan->planTree = (Plan *) customScan;
-		resultPlan->rtable = lappend(resultPlan->rtable, rangeTableEntry);
-		customScan->scan.plan.targetlist = targetList;
+		finalPlan = CreateRouterFinalPlan(localPlan, multiPlan, customScan);
 	}
 
-	return resultPlan;
+	return finalPlan;
+}
+
+
+static PlannedStmt *
+CreateRealTimeFinalPlan(PlannedStmt *localPlan, MultiPlan *multiPlan,
+						CustomScan *customScan)
+{
+	PlannedStmt *finalPlan = NULL;
+
+	finalPlan = MasterNodeSelectPlan(multiPlan, customScan);
+	finalPlan->queryId = localPlan->queryId;
+	finalPlan->utilityStmt = localPlan->utilityStmt;
+
+	return finalPlan;
+}
+
+
+static PlannedStmt *
+CreateRouterFinalPlan(PlannedStmt *localPlan, MultiPlan *multiPlan,
+					  CustomScan *customScan)
+{
+	PlannedStmt *finalPlan = NULL;
+	RangeTblEntry *customScanRangeTableEntry = NULL;
+	ListCell *targetEntryCell = NULL;
+	List *targetList = NIL;
+	List *columnNameList = NIL;
+
+	int rangeTableCount = list_length(localPlan->rtable);
+	int customScanRangeTableIndex = rangeTableCount + 1;
+
+	/* build a targetlist to "read" from the custom scan output */
+	foreach(targetEntryCell, localPlan->planTree->targetlist)
+	{
+		TargetEntry *targetEntry = lfirst(targetEntryCell);
+		TargetEntry *newTargetEntry = NULL;
+		Var *newVar = NULL;
+		Value *columnName = NULL;
+
+		Assert(IsA(targetEntry, TargetEntry));
+
+		/*
+		 * This is unlikely to be hit because we would not need resjunk stuff
+		 * at the toplevel of a router query - all things needing it have been
+		 * pushed down.
+		 */
+		if (targetEntry->resjunk)
+		{
+			continue;
+		}
+
+		/* build target entry pointing to custom scan range table entry */
+		newVar = makeVarFromTargetEntry(customScanRangeTableIndex, targetEntry);
+		newTargetEntry = flatCopyTargetEntry(targetEntry);
+		newTargetEntry->expr = (Expr *) newVar;
+		targetList = lappend(targetList, newTargetEntry);
+
+		columnName = makeString(targetEntry->resname);
+		columnNameList = lappend(columnNameList, columnName);
+	}
+
+	customScan->scan.plan.targetlist = targetList;
+	customScanRangeTableEntry = CustomScanRangeTableEntry(columnNameList);
+
+	finalPlan = localPlan;
+	finalPlan->planTree = (Plan *) customScan;
+	finalPlan->rtable = lappend(finalPlan->rtable, customScanRangeTableEntry);
+
+	return finalPlan;
+}
+
+
+/*
+ *
+ */
+RangeTblEntry *
+CustomScanRangeTableEntry(List *columnNameList)
+{
+	RangeTblEntry *customScanRangeTableEntry = makeNode(RangeTblEntry);
+
+	/* we use RTE_VALUES for custom scan because we can't look up relation */
+	customScanRangeTableEntry->rtekind = RTE_VALUES;
+	customScanRangeTableEntry->eref = makeAlias("remote_scan", columnNameList);
+	customScanRangeTableEntry->inh = false;
+	customScanRangeTableEntry->inFromCl = true;
+
+	return customScanRangeTableEntry;
 }
 
 

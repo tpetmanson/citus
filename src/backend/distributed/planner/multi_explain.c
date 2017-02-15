@@ -84,12 +84,13 @@ static void ExplainXMLTag(const char *tagname, int flags, ExplainState *es);
 static void ExplainJSONLineEnding(ExplainState *es);
 static void ExplainYAMLLineStarting(ExplainState *es);
 
+
 void
 CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	MultiPlan *multiPlan = scanState->multiPlan;
-	const char *executorName = NULL;
+	const char *executorName = ExecutorName(scanState->executorType);
 
 	if (!ExplainDistributedQueries)
 	{
@@ -99,17 +100,21 @@ CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es
 		return;
 	}
 
-	/*
-	 * XXX: can we get by without the open/close group somehow - then we'd not
-	 * copy any code from explain.c? Seems unlikely.
-	 */
 	ExplainOpenGroup("Distributed Query", "Distributed Query", true, es);
 
-	/*
-	 * XXX: might be worthwhile to put this somewhere central, e.g. for
-	 * debugging output.
-	 */
-	switch (scanState->executorType)
+	ExplainPropertyText("Executor", executorName, es);
+	ExplainJob(multiPlan->workerJob, es);
+
+	ExplainCloseGroup("Distributed Query", "Distributed Query", true, es);
+}
+
+
+char *
+ExecutorName(MultiExecutorType executorType)
+{
+	char *executorName = NULL;
+
+	switch (executorType)
 	{
 		case MULTI_EXECUTOR_ROUTER:
 		{
@@ -135,11 +140,8 @@ CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es
 		}
 		break;
 	}
-	ExplainPropertyText("Executor", executorName, es);
 
-	ExplainJob(multiPlan->workerJob, es);
-
-	ExplainCloseGroup("Distributed Query", "Distributed Query", true, es);
+	return executorName;
 }
 
 

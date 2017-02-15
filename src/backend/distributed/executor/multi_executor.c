@@ -34,50 +34,64 @@
 
 
 /*
- * FIXME: It'd probably be better to have different set of methods for:
- * - router readonly queries
- * - router modify
- * - router insert ... select
- * - real-time/task-tracker (no point in seperating those)
+ * FIXME: Comment
  *
  * I think it's better however to only have one type of CitusScanState, to
  * allow to easily share code between routines.
  */
-static CustomExecMethods CitusCustomExecMethods = {
-	"CitusScan",
-	CitusBeginScan,
-	CitusExecScan,
-	CitusEndScan,
-	CitusReScan,
-#if (PG_VERSION_NUM >= 90600)
-	NULL, /* NO EstimateDSMCustomScan callback */
-	NULL, /* NO InitializeDSMCustomScan callback */
-	NULL, /* NO InitializeWorkerCustomScan callback */
-#endif
-	NULL,
-	NULL,
-	CitusExplainScan
+static CustomExecMethods RealTimeCustomExecMethods = {
+	.CustomName = "RealTimeScan",
+	.BeginCustomScan = RealTimeBeginScan,
+	.ExecCustomScan = RealTimeExecScan,
+	.EndCustomScan = CitusEndScan,
+	.ReScanCustomScan = CitusReScan,
+	.ExplainCustomScan = CitusExplainScan
 };
+
+static CustomExecMethods RouterCustomExecMethods = {
+	.CustomName = "RouterScan",
+	.BeginCustomScan = RouterBeginScan,
+	.ExecCustomScan = RouterExecScan,
+	.EndCustomScan = CitusEndScan,
+	.ReScanCustomScan = CitusReScan,
+	.ExplainCustomScan = CitusExplainScan
+};
+
+
+static void LoadTuplesIntoTupleStore(CitusScanState *scanState, List *workerTaskList);
+static Relation FauxRelation(TupleDesc tupleDescriptor);
 
 
 Node *
 CitusCreateScan(CustomScan *scan)
 {
 	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
-
 	scanState->customScanState.ss.ps.type = T_CustomScanState;
-	scanState->customScanState.methods = &CitusCustomExecMethods;
 	scanState->multiPlan = GetMultiPlan(scan);
 	scanState->executorType = JobExecutorType(scanState->multiPlan);
+
+	if (scanState->executorType == MULTI_EXECUTOR_ROUTER)
+	{
+		scanState->customScanState.methods = &RouterCustomExecMethods;
+	}
+	else
+	{
+		scanState->customScanState.methods = &RealTimeCustomExecMethods;
+	}
 
 	return (Node *) scanState;
 }
 
 
 void
-CitusBeginScan(CustomScanState *node,
-			   EState *estate,
-			   int eflags)
+RealTimeBeginScan(CustomScanState *node, EState *estate, int eflags)
+{
+	ValidateCitusScanState(node);
+}
+
+
+void
+ValidateCitusScanState(CustomScanState *node)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	MultiPlan *multiPlan = scanState->multiPlan;
@@ -86,157 +100,174 @@ CitusBeginScan(CustomScanState *node,
 
 	/* ensure plan is executable */
 	VerifyMultiPlanValidity(multiPlan);
-
-	/* ExecCheckRTPerms(planStatement->rtable, true); */
-
-	if (scanState->executorType == MULTI_EXECUTOR_ROUTER)
-	{
-		RouterBeginScan(scanState);
-	}
 }
 
 
 TupleTableSlot *
-CitusExecScan(CustomScanState *node)
+RealTimeExecScan(CustomScanState *node)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	MultiPlan *multiPlan = scanState->multiPlan;
 
-	if (scanState->executorType == MULTI_EXECUTOR_ROUTER)
-	{
-		return RouterExecScan(scanState);
-	}
-	else
-	{
-		TupleTableSlot *resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
+	TupleTableSlot *resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
 
-		if (!scanState->finishedUnderlyingScan)
+	if (!scanState->finishedRemoteScan)
+	{
+		Job *workerJob = multiPlan->workerJob;
+		StringInfo jobDirectoryName = NULL;
+		EState *executorState = scanState->customScanState.ss.ps.state;
+		List *workerTaskList = workerJob->taskList;
+
+		/*
+		 * We create a directory on the master node to keep task execution results.
+		 * We also register this directory for automatic cleanup on portal delete.
+		 */
+		jobDirectoryName = MasterJobDirectoryName(workerJob->jobId);
+		CreateDirectory(jobDirectoryName);
+
+		ResourceOwnerEnlargeJobDirectories(CurrentResourceOwner);
+		ResourceOwnerRememberJobDirectory(CurrentResourceOwner, workerJob->jobId);
+
+		/* pick distributed executor to use */
+		if (executorState->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		{
-			Job *workerJob = multiPlan->workerJob;
-			StringInfo jobDirectoryName = NULL;
-			EState *executorState = scanState->customScanState.ss.ps.state;
-			List *workerTaskList = workerJob->taskList;
-			ListCell *workerTaskCell = NULL;
-			TupleDesc tupleDescriptor = NULL;
-			Relation fakeRel = NULL;
-			MemoryContext executorTupleContext = GetPerTupleMemoryContext(executorState);
-			ExprContext *executorExpressionContext =
-				GetPerTupleExprContext(executorState);
-			uint32 columnCount = 0;
-			Datum *columnValues = NULL;
-			bool *columnNulls = NULL;
-
-			/*
-			 * We create a directory on the master node to keep task execution results.
-			 * We also register this directory for automatic cleanup on portal delete.
-			 */
-			jobDirectoryName = MasterJobDirectoryName(workerJob->jobId);
-			CreateDirectory(jobDirectoryName);
-
-			ResourceOwnerEnlargeJobDirectories(CurrentResourceOwner);
-			ResourceOwnerRememberJobDirectory(CurrentResourceOwner, workerJob->jobId);
-
-			/* pick distributed executor to use */
-			if (executorState->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY)
-			{
-				/* skip distributed query execution for EXPLAIN commands */
-			}
-			else if (scanState->executorType == MULTI_EXECUTOR_REAL_TIME)
-			{
-				MultiRealTimeExecute(workerJob);
-			}
-			else if (scanState->executorType == MULTI_EXECUTOR_TASK_TRACKER)
-			{
-				MultiTaskTrackerExecute(workerJob);
-			}
-
-			tupleDescriptor = node->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
-
-			/*
-			 * Load data, collected by Multi*Execute() above, into a
-			 * tuplestore. For that first create a tuplestore, and then copy
-			 * the files one-by-one.
-			 *
-			 * FIXME: Should probably be in a separate routine.
-			 *
-			 * Long term it'd be a lot better if Multi*Execute() directly
-			 * filled the tuplestores, but that's a fair bit of work.
-			 */
-
-			/*
-			 * To be able to use copy.c, we need a Relation descriptor.  As
-			 * there's no relation corresponding to the data loaded from
-			 * workers, fake one.  We just need the bare minimal set of fields
-			 * accessed by BeginCopyFrom().
-			 *
-			 * FIXME: should be abstracted into a separate function.
-			 */
-			fakeRel = palloc0(sizeof(RelationData));
-			fakeRel->rd_att = tupleDescriptor;
-			fakeRel->rd_rel = palloc0(sizeof(FormData_pg_class));
-			fakeRel->rd_rel->relkind = RELKIND_RELATION;
-
-			columnCount = tupleDescriptor->natts;
-			columnValues = palloc0(columnCount * sizeof(Datum));
-			columnNulls = palloc0(columnCount * sizeof(bool));
-
-			Assert(scanState->tuplestorestate == NULL);
-			scanState->tuplestorestate = tuplestore_begin_heap(false, false, work_mem);
-
-			foreach(workerTaskCell, workerTaskList)
-			{
-				Task *workerTask = (Task *) lfirst(workerTaskCell);
-				StringInfo jobDirectoryName = MasterJobDirectoryName(workerTask->jobId);
-				StringInfo taskFilename =
-					TaskFilename(jobDirectoryName, workerTask->taskId);
-				List *copyOptions = NIL;
-				CopyState copyState = NULL;
-
-				if (BinaryMasterCopyFormat)
-				{
-					DefElem *copyOption = makeDefElem("format",
-													  (Node *) makeString("binary"));
-					copyOptions = lappend(copyOptions, copyOption);
-				}
-				copyState = BeginCopyFrom(fakeRel, taskFilename->data, false, NULL,
-										  copyOptions);
-
-				while (true)
-				{
-					MemoryContext oldContext = NULL;
-					bool nextRowFound = false;
-
-					ResetPerTupleExprContext(executorState);
-					oldContext = MemoryContextSwitchTo(executorTupleContext);
-
-					nextRowFound = NextCopyFrom(copyState, executorExpressionContext,
-												columnValues, columnNulls, NULL);
-					if (!nextRowFound)
-					{
-						MemoryContextSwitchTo(oldContext);
-						break;
-					}
-
-					tuplestore_putvalues(scanState->tuplestorestate,
-										 tupleDescriptor,
-										 columnValues, columnNulls);
-					MemoryContextSwitchTo(oldContext);
-				}
-			}
-
-			scanState->finishedUnderlyingScan = true;
+			/* skip distributed query execution for EXPLAIN commands */
+		}
+		else if (scanState->executorType == MULTI_EXECUTOR_REAL_TIME)
+		{
+			MultiRealTimeExecute(workerJob);
+		}
+		else if (scanState->executorType == MULTI_EXECUTOR_TASK_TRACKER)
+		{
+			MultiTaskTrackerExecute(workerJob);
 		}
 
-		if (scanState->tuplestorestate != NULL)
-		{
-			Tuplestorestate *tupleStore = scanState->tuplestorestate;
-			tuplestore_gettupleslot(tupleStore, true, false, resultSlot);
+		LoadTuplesIntoTupleStore(scanState, workerTaskList);
 
-			return resultSlot;
+		scanState->finishedRemoteScan = true;
+	}
+
+	if (scanState->tuplestorestate != NULL)
+	{
+		ReadNextTuple(scanState, resultSlot);
+		return resultSlot;
+	}
+
+	return NULL;
+}
+
+
+/*
+ * Load data collected by real-time or task-tracker executors into the tuplestore
+ * of CitusScanState. For that first create a tuplestore, and then copy the
+ * files one-by-one.
+ *
+ * Note that in the long term it'd be a lot better if Multi*Execute() directly
+ * filled the tuplestores, but that's a fair bit of work.
+ */
+static void
+LoadTuplesIntoTupleStore(CitusScanState *scanState, List *workerTaskList)
+{
+	CustomScanState customScanState = scanState->customScanState;
+	EState *executorState = NULL;
+	MemoryContext executorTupleContext = NULL;
+	ExprContext *executorExpressionContext = NULL;
+	TupleDesc tupleDescriptor = NULL;
+	Relation fauxRelation = NULL;
+	ListCell *workerTaskCell = NULL;
+	uint32 columnCount = 0;
+	Datum *columnValues = NULL;
+	bool *columnNulls = NULL;
+
+	executorState = scanState->customScanState.ss.ps.state;
+	executorTupleContext = GetPerTupleMemoryContext(executorState);
+	executorExpressionContext = GetPerTupleExprContext(executorState);
+
+	tupleDescriptor = customScanState.ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
+	fauxRelation = FauxRelation(tupleDescriptor);
+
+	columnCount = tupleDescriptor->natts;
+	columnValues = palloc0(columnCount * sizeof(Datum));
+	columnNulls = palloc0(columnCount * sizeof(bool));
+
+	Assert(scanState->tuplestorestate == NULL);
+	scanState->tuplestorestate = tuplestore_begin_heap(true, false, work_mem);
+
+	foreach(workerTaskCell, workerTaskList)
+	{
+		Task *workerTask = (Task *) lfirst(workerTaskCell);
+		StringInfo jobDirectoryName = MasterJobDirectoryName(workerTask->jobId);
+		StringInfo taskFilename = TaskFilename(jobDirectoryName, workerTask->taskId);
+		List *copyOptions = NIL;
+		CopyState copyState = NULL;
+
+		if (BinaryMasterCopyFormat)
+		{
+			DefElem *copyOption = makeDefElem("format", (Node *) makeString("binary"));
+			copyOptions = lappend(copyOptions, copyOption);
 		}
 
-		return NULL;
+		copyState = BeginCopyFrom(fauxRelation, taskFilename->data, false, NULL,
+								  copyOptions);
+
+		while (true)
+		{
+			MemoryContext oldContext = NULL;
+			bool nextRowFound = false;
+
+			ResetPerTupleExprContext(executorState);
+			oldContext = MemoryContextSwitchTo(executorTupleContext);
+
+			nextRowFound = NextCopyFrom(copyState, executorExpressionContext,
+										columnValues, columnNulls, NULL);
+			if (!nextRowFound)
+			{
+				MemoryContextSwitchTo(oldContext);
+				break;
+			}
+
+			tuplestore_putvalues(scanState->tuplestorestate, tupleDescriptor,
+								 columnValues, columnNulls);
+			MemoryContextSwitchTo(oldContext);
+		}
 	}
+}
+
+
+/*
+ * FauxRelation creates a faux Relation from the given tuple descriptor.
+ * To be able to use copy.c, we need a Relation descriptor. As there's no
+ * relation corresponding to the data loaded from workers, we need to fake one.
+ * We just need the bare minimal set of fields accessed by BeginCopyFrom().
+ */
+static Relation
+FauxRelation(TupleDesc tupleDescriptor)
+{
+	Relation fauxRelation = palloc0(sizeof(RelationData));
+	fauxRelation->rd_att = tupleDescriptor;
+	fauxRelation->rd_rel = palloc0(sizeof(FormData_pg_class));
+	fauxRelation->rd_rel->relkind = RELKIND_RELATION;
+
+	return fauxRelation;
+}
+
+
+void
+ReadNextTuple(CitusScanState *scanState, TupleTableSlot *resultSlot)
+{
+	Tuplestorestate *tupleStore = scanState->tuplestorestate;
+	ScanDirection scanDirection = NoMovementScanDirection;
+	bool forwardScanDirection = true;
+
+	scanDirection = scanState->customScanState.ss.ps.state->es_direction;
+	Assert(ScanDirectionIsValid(scanDirection));
+
+	if (ScanDirectionIsBackward(scanDirection))
+	{
+		forwardScanDirection = false;
+	}
+
+	tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, resultSlot);
 }
 
 
@@ -256,14 +287,7 @@ CitusEndScan(CustomScanState *node)
 void
 CitusReScan(CustomScanState *node)
 {
-	CitusScanState *scanState = (CitusScanState *) node;
-
-	scanState->tuplestorestate = NULL;
-	scanState->finishedUnderlyingScan = true;
-
-	/*
-	 * XXX: this probably already works, but if not should be easily
-	 * supportable - probably hard to exercise right now though.
-	 */
-	elog(WARNING, "unsupported at this point");
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("rescan is unsupported"),
+					errdetail("We don't expect this code path to be executed.")));
 }
