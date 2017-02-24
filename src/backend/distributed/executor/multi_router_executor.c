@@ -89,6 +89,7 @@ static List * TaskShardIntervalList(List *taskList);
 static void AcquireExecutorShardLock(Task *task, CmdType commandType);
 static void AcquireExecutorMultiShardLocks(List *taskList);
 static bool RequiresConsistentSnapshot(Task *task);
+static void ProcessMasterEvaluableFunctions(Job *workerJob);
 static void ExtractParametersFromParamListInfo(ParamListInfo paramListInfo,
 											   Oid **parameterTypes,
 											   const char ***parameterValues);
@@ -434,23 +435,16 @@ TupleTableSlot *
 RouterExecScan(CustomScanState *node)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
-	MultiPlan *multiPlan = scanState->multiPlan;
-	TupleTableSlot *resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
+	TupleTableSlot *resultSlot = NULL;
 
 	if (!scanState->finishedRemoteScan)
 	{
+		MultiPlan *multiPlan = scanState->multiPlan;
 		Job *workerJob = multiPlan->workerJob;
 		List *taskList = workerJob->taskList;
-		bool requiresMasterEvaluation = workerJob->requiresMasterEvaluation;
 		bool isModificationQuery = IsModificationPlan(multiPlan);
 
-		if (requiresMasterEvaluation)
-		{
-			Query *jobQuery = workerJob->jobQuery;
-
-			ExecuteMasterEvaluableFunctions(jobQuery);
-			RebuildQueryStrings(jobQuery, taskList);
-		}
+		ProcessMasterEvaluableFunctions(workerJob);
 
 		if (list_length(taskList) == 1)
 		{
@@ -478,13 +472,23 @@ RouterExecScan(CustomScanState *node)
 	}
 
 	/* if the underlying query produced output, return it */
-	if (scanState->tuplestorestate != NULL)
-	{
-		ReadNextTuple(scanState, resultSlot);
-		return resultSlot;
-	}
+	resultSlot = ReadNextTuple(scanState);
 
-	return NULL;
+	return resultSlot;
+}
+
+
+static void
+ProcessMasterEvaluableFunctions(Job *workerJob)
+{
+	if (workerJob->requiresMasterEvaluation)
+	{
+		Query *jobQuery = workerJob->jobQuery;
+		List *taskList = workerJob->taskList;
+
+		ExecuteMasterEvaluableFunctions(jobQuery);
+		RebuildQueryStrings(jobQuery, taskList);
+	}
 }
 
 

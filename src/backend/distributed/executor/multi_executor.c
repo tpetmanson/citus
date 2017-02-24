@@ -58,7 +58,8 @@ static CustomExecMethods RouterCustomExecMethods = {
 };
 
 
-static void LoadTuplesIntoTupleStore(CitusScanState *scanState, List *workerTaskList);
+static void PrepareMasterJobDirectory(Job *workerJob);
+static void LoadTuplesIntoTupleStore(CitusScanState *scanState, Job *workerJob);
 static Relation FauxRelation(TupleDesc tupleDescriptor);
 
 
@@ -107,33 +108,17 @@ TupleTableSlot *
 RealTimeExecScan(CustomScanState *node)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
-	MultiPlan *multiPlan = scanState->multiPlan;
-
-	TupleTableSlot *resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
+	TupleTableSlot *resultSlot = NULL;
 
 	if (!scanState->finishedRemoteScan)
 	{
+		MultiPlan *multiPlan = scanState->multiPlan;
 		Job *workerJob = multiPlan->workerJob;
-		StringInfo jobDirectoryName = NULL;
-		EState *executorState = scanState->customScanState.ss.ps.state;
-		List *workerTaskList = workerJob->taskList;
 
-		/*
-		 * We create a directory on the master node to keep task execution results.
-		 * We also register this directory for automatic cleanup on portal delete.
-		 */
-		jobDirectoryName = MasterJobDirectoryName(workerJob->jobId);
-		CreateDirectory(jobDirectoryName);
-
-		ResourceOwnerEnlargeJobDirectories(CurrentResourceOwner);
-		ResourceOwnerRememberJobDirectory(CurrentResourceOwner, workerJob->jobId);
+		PrepareMasterJobDirectory(workerJob);
 
 		/* pick distributed executor to use */
-		if (executorState->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY)
-		{
-			/* skip distributed query execution for EXPLAIN commands */
-		}
-		else if (scanState->executorType == MULTI_EXECUTOR_REAL_TIME)
+		if (scanState->executorType == MULTI_EXECUTOR_REAL_TIME)
 		{
 			MultiRealTimeExecute(workerJob);
 		}
@@ -142,18 +127,30 @@ RealTimeExecScan(CustomScanState *node)
 			MultiTaskTrackerExecute(workerJob);
 		}
 
-		LoadTuplesIntoTupleStore(scanState, workerTaskList);
+		LoadTuplesIntoTupleStore(scanState, workerJob);
 
 		scanState->finishedRemoteScan = true;
 	}
 
-	if (scanState->tuplestorestate != NULL)
-	{
-		ReadNextTuple(scanState, resultSlot);
-		return resultSlot;
-	}
+	resultSlot = ReadNextTuple(scanState);
 
-	return NULL;
+	return resultSlot;
+}
+
+
+/*
+ * PrepareMasterJobDirectory creates a directory on the master node to keep task
+ * execution results. We also register this directory for automatic cleanup on
+ * portal delete.
+ */
+static void
+PrepareMasterJobDirectory(Job *workerJob)
+{
+	StringInfo jobDirectoryName = MasterJobDirectoryName(workerJob->jobId);
+	CreateDirectory(jobDirectoryName);
+
+	ResourceOwnerEnlargeJobDirectories(CurrentResourceOwner);
+	ResourceOwnerRememberJobDirectory(CurrentResourceOwner, workerJob->jobId);
 }
 
 
@@ -166,9 +163,10 @@ RealTimeExecScan(CustomScanState *node)
  * filled the tuplestores, but that's a fair bit of work.
  */
 static void
-LoadTuplesIntoTupleStore(CitusScanState *scanState, List *workerTaskList)
+LoadTuplesIntoTupleStore(CitusScanState *scanState, Job *workerJob)
 {
 	CustomScanState customScanState = scanState->customScanState;
+	List *workerTaskList = workerJob->taskList;
 	EState *executorState = NULL;
 	MemoryContext executorTupleContext = NULL;
 	ExprContext *executorExpressionContext = NULL;
@@ -252,12 +250,18 @@ FauxRelation(TupleDesc tupleDescriptor)
 }
 
 
-void
-ReadNextTuple(CitusScanState *scanState, TupleTableSlot *resultSlot)
+TupleTableSlot *
+ReadNextTuple(CitusScanState *scanState)
 {
 	Tuplestorestate *tupleStore = scanState->tuplestorestate;
+	TupleTableSlot *resultSlot = NULL;
 	ScanDirection scanDirection = NoMovementScanDirection;
 	bool forwardScanDirection = true;
+
+	if (tupleStore == NULL)
+	{
+		return NULL;
+	}
 
 	scanDirection = scanState->customScanState.ss.ps.state->es_direction;
 	Assert(ScanDirectionIsValid(scanDirection));
@@ -267,7 +271,10 @@ ReadNextTuple(CitusScanState *scanState, TupleTableSlot *resultSlot)
 		forwardScanDirection = false;
 	}
 
+	resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
 	tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, resultSlot);
+
+	return resultSlot;
 }
 
 

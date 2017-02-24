@@ -43,7 +43,7 @@ extern void CitusExplainScan(CustomScanState *node, List *ancestors,
 							 struct ExplainState *es);
 extern char * ExecutorName(MultiExecutorType executorType);
 extern void ValidateCitusScanState(CustomScanState *node);
-extern void ReadNextTuple(CitusScanState *scanState, TupleTableSlot *resultSlot);
+extern TupleTableSlot * ReadNextTuple(CitusScanState *scanState);
 
 
 #endif /* MULTI_EXECUTOR_H */
