@@ -87,6 +87,9 @@ static Task * RouterModifyTaskForShardInterval(Query *originalQuery,
 											   RelationRestrictionContext *
 											   restrictionContext,
 											   uint32 taskIdIndex);
+static bool ExpressionsAreEqual(PlannerInfo *root, Index rteIndex, Node *item1,
+								Node *item2);
+
 static bool MasterIrreducibleExpression(Node *expression, bool *varArgument,
 										bool *badCoalesce);
 static bool MasterIrreducibleExpressionWalker(Node *expression, WalkerState *state);
@@ -369,6 +372,13 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	/* grab shared metadata lock to stop concurrent placement additions */
 	LockShardDistributionMetadata(shardId, ShareLock);
 
+
+	Param *equalityParameter = makeNode(Param);
+
+	equalityParameter->paramkind = PARAM_EXTERN;
+	equalityParameter->paramid = UNINSTANTIATED_PARAMETER_ID;
+
+
 	/*
 	 * Replace the partitioning qual parameter value in all baserestrictinfos.
 	 * Note that this has to be done on a copy, as the walker modifies in place.
@@ -377,19 +387,32 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	{
 		RelationRestriction *restriction = lfirst(restrictionCell);
 		List *originalBaserestrictInfo = restriction->relOptInfo->baserestrictinfo;
+		Var *relationPartitionKey = PartitionColumn(restriction->relationId,
+													restriction->index);
 
 		/*
 		 * We haven't added the quals if all participating tables are reference
 		 * tables. Thus, now skip instantiating them.
 		 */
-		if (allReferenceTables)
+		if (!relationPartitionKey)
 		{
-			break;
+			continue;
 		}
 
-		originalBaserestrictInfo =
-			(List *) InstantiatePartitionQual((Node *) originalBaserestrictInfo,
-											  shardInterval);
+		equalityParameter->paramtype = relationPartitionKey->vartype;
+		equalityParameter->paramtypmod = relationPartitionKey->vartypmod;
+		equalityParameter->paramcollid = relationPartitionKey->varcollid;
+		equalityParameter->location = -1;
+
+
+		if (ExpressionsAreEqual(restriction->plannerInfo, restriction->index,
+								(Node *) relationPartitionKey,
+								(Node *) equalityParameter))
+		{
+			originalBaserestrictInfo =
+				(List *) InstantiatePartitionQual((Node *) originalBaserestrictInfo,
+												  shardInterval);
+		}
 	}
 
 	/*
@@ -485,6 +508,61 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	modifyTask->replicationModel = cacheEntry->replicationModel;
 
 	return modifyTask;
+}
+
+
+static bool
+ExpressionsAreEqual(PlannerInfo *root, Index rteIndex, Node *item1, Node *item2)
+{
+	ListCell *lc1;
+
+	foreach(lc1, root->eq_classes)
+	{
+		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc1);
+		bool item1member = false;
+		bool item2member = false;
+		ListCell *lc2;
+		Bitmapset *bms = bms_make_singleton(rteIndex);
+
+		/* Never match to a volatile EC */
+		if (ec->ec_has_volatile)
+		{
+			continue;
+		}
+
+		if (!bms_overlap(bms, ec->ec_relids))
+		{
+			continue;
+		}
+
+		foreach(lc2, ec->ec_members)
+		{
+			EquivalenceMember *em = (EquivalenceMember *) lfirst(lc2);
+
+			if (em->em_is_child)
+			{
+				continue;       /* ignore children here */
+			}
+			/*	if (IsA(em->em_expr, Var) && !equal(em->em_expr, item1)) */
+			/*	continue; */
+
+			if (equal(item1, em->em_expr))
+			{
+				item1member = true;
+			}
+			else if (equal(item2, em->em_expr))
+			{
+				item2member = true;
+			}
+
+			/* Exit as soon as equality is proven */
+			if (item1member && item2member)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 
