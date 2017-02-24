@@ -409,6 +409,41 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 								(Node *) relationPartitionKey,
 								(Node *) equalityParameter))
 		{
+			OpExpr *uninstantiatedEqualityQual = NULL;
+			Oid partitionColumnCollid = InvalidOid;
+			Oid lessThanOperator = InvalidOid;
+			Oid equalsOperator = InvalidOid;
+			Oid greaterOperator = InvalidOid;
+			bool hashable = false;
+
+
+			/* get the necessary equality operator */
+			get_sort_group_operators(relationPartitionKey->vartype, false, true, false,
+									 &lessThanOperator, &equalsOperator, &greaterOperator,
+									 &hashable);
+
+
+			/* create an equality on the on the target partition column */
+			uninstantiatedEqualityQual = (OpExpr *) make_opclause(equalsOperator,
+																  InvalidOid,
+																  false,
+																  (Expr *)
+																  relationPartitionKey,
+																  (Expr *)
+																  equalityParameter,
+																  partitionColumnCollid,
+																  partitionColumnCollid);
+
+			/* update the operators with correct operator numbers and function ids */
+			uninstantiatedEqualityQual->opfuncid = get_opcode(
+				uninstantiatedEqualityQual->opno);
+			uninstantiatedEqualityQual->opresulttype =
+				get_func_rettype(uninstantiatedEqualityQual->opfuncid);
+
+
+			RestrictInfo *rest = make_simple_restrictinfo((Expr *) uninstantiatedEqualityQual);
+			originalBaserestrictInfo = lappend(originalBaserestrictInfo, rest);
+
 			originalBaserestrictInfo =
 				(List *) InstantiatePartitionQual((Node *) originalBaserestrictInfo,
 												  shardInterval);
@@ -543,6 +578,7 @@ ExpressionsAreEqual(PlannerInfo *root, Index rteIndex, Node *item1, Node *item2)
 			{
 				continue;       /* ignore children here */
 			}
+
 			/*	if (IsA(em->em_expr, Var) && !equal(em->em_expr, item1)) */
 			/*	continue; */
 
