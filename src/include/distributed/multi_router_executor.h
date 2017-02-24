@@ -35,9 +35,13 @@ typedef struct XactShardConnSet
 extern bool AllModificationsCommutative;
 extern bool EnableDeadlockPrevention;
 
-extern void RouterBeginScan(CustomScanState *node, EState *estate, int eflags);
-extern TupleTableSlot * RouterExecScan(CustomScanState *node);
+extern void CitusModifyBeginScan(CustomScanState *node, EState *estate, int eflags);
+extern TupleTableSlot * RouterModificationExecScan(CustomScanState *node);
+extern TupleTableSlot * RouterSelectExecScan(CustomScanState *node);
+extern TupleTableSlot * RouterMultipleTasksExecScan(CustomScanState *node);
+extern bool IsModificationPlan(MultiPlan *multiPlan);
 
 extern int64 ExecuteModifyTasksWithoutResults(List *taskList);
+
 
 #endif /* MULTI_ROUTER_EXECUTOR_H_ */

@@ -35,8 +35,9 @@ typedef struct CitusScanState
 } CitusScanState;
 
 Node * CitusCreateScan(CustomScan *scan);
-extern void RealTimeBeginScan(CustomScanState *node, EState *estate, int eflags);
+extern void CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags);
 extern TupleTableSlot * RealTimeExecScan(CustomScanState *node);
+extern TupleTableSlot * TaskTrackerExecScan(CustomScanState *node);
 extern void CitusEndScan(CustomScanState *node);
 extern void CitusReScan(CustomScanState *node);
 extern void CitusExplainScan(CustomScanState *node, List *ancestors,

@@ -41,17 +41,44 @@
  */
 static CustomExecMethods RealTimeCustomExecMethods = {
 	.CustomName = "RealTimeScan",
-	.BeginCustomScan = RealTimeBeginScan,
+	.BeginCustomScan = CitusSelectBeginScan,
 	.ExecCustomScan = RealTimeExecScan,
 	.EndCustomScan = CitusEndScan,
 	.ReScanCustomScan = CitusReScan,
 	.ExplainCustomScan = CitusExplainScan
 };
 
-static CustomExecMethods RouterCustomExecMethods = {
-	.CustomName = "RouterScan",
-	.BeginCustomScan = RouterBeginScan,
-	.ExecCustomScan = RouterExecScan,
+static CustomExecMethods TaskTrackerCustomExecMethods = {
+	.CustomName = "TaskTrackerScan",
+	.BeginCustomScan = CitusSelectBeginScan,
+	.ExecCustomScan = TaskTrackerExecScan,
+	.EndCustomScan = CitusEndScan,
+	.ReScanCustomScan = CitusReScan,
+	.ExplainCustomScan = CitusExplainScan
+};
+
+static CustomExecMethods RouterModificationCustomExecMethods = {
+	.CustomName = "RouterModificationScan",
+	.BeginCustomScan = CitusModifyBeginScan,
+	.ExecCustomScan = RouterModificationExecScan,
+	.EndCustomScan = CitusEndScan,
+	.ReScanCustomScan = CitusReScan,
+	.ExplainCustomScan = CitusExplainScan
+};
+
+static CustomExecMethods RouterSelectCustomExecMethods = {
+	.CustomName = "RouterModificationScan",
+	.BeginCustomScan = CitusSelectBeginScan,
+	.ExecCustomScan = RouterSelectExecScan,
+	.EndCustomScan = CitusEndScan,
+	.ReScanCustomScan = CitusReScan,
+	.ExplainCustomScan = CitusExplainScan
+};
+
+static CustomExecMethods RouterMultipleTasksCustomExecMethods = {
+	.CustomName = "RouterModificationScan",
+	.BeginCustomScan = CitusModifyBeginScan,
+	.ExecCustomScan = RouterMultipleTasksExecScan,
 	.EndCustomScan = CitusEndScan,
 	.ReScanCustomScan = CitusReScan,
 	.ExplainCustomScan = CitusExplainScan
@@ -73,11 +100,34 @@ CitusCreateScan(CustomScan *scan)
 
 	if (scanState->executorType == MULTI_EXECUTOR_ROUTER)
 	{
-		scanState->customScanState.methods = &RouterCustomExecMethods;
+		MultiPlan *multiPlan = scanState->multiPlan;
+		Job *workerJob = multiPlan->workerJob;
+		List *taskList = workerJob->taskList;
+		bool isModificationQuery = IsModificationPlan(multiPlan);
+
+		if (list_length(taskList) == 1)
+		{
+			if (isModificationQuery)
+			{
+				scanState->customScanState.methods = &RouterModificationCustomExecMethods;
+			}
+			else
+			{
+				scanState->customScanState.methods = &RouterSelectCustomExecMethods;
+			}
+		}
+		else
+		{
+			scanState->customScanState.methods = &RouterMultipleTasksCustomExecMethods;
+		}
 	}
-	else
+	else if (scanState->executorType == MULTI_EXECUTOR_REAL_TIME)
 	{
 		scanState->customScanState.methods = &RealTimeCustomExecMethods;
+	}
+	else if (scanState->executorType == MULTI_EXECUTOR_TASK_TRACKER)
+	{
+		scanState->customScanState.methods = &TaskTrackerCustomExecMethods;
 	}
 
 	return (Node *) scanState;
@@ -85,7 +135,7 @@ CitusCreateScan(CustomScan *scan)
 
 
 void
-RealTimeBeginScan(CustomScanState *node, EState *estate, int eflags)
+CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags)
 {
 	ValidateCitusScanState(node);
 }
@@ -116,16 +166,32 @@ RealTimeExecScan(CustomScanState *node)
 		Job *workerJob = multiPlan->workerJob;
 
 		PrepareMasterJobDirectory(workerJob);
+		MultiRealTimeExecute(workerJob);
 
-		/* pick distributed executor to use */
-		if (scanState->executorType == MULTI_EXECUTOR_REAL_TIME)
-		{
-			MultiRealTimeExecute(workerJob);
-		}
-		else if (scanState->executorType == MULTI_EXECUTOR_TASK_TRACKER)
-		{
-			MultiTaskTrackerExecute(workerJob);
-		}
+		LoadTuplesIntoTupleStore(scanState, workerJob);
+
+		scanState->finishedRemoteScan = true;
+	}
+
+	resultSlot = ReadNextTuple(scanState);
+
+	return resultSlot;
+}
+
+
+TupleTableSlot *
+TaskTrackerExecScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+	TupleTableSlot *resultSlot = NULL;
+
+	if (!scanState->finishedRemoteScan)
+	{
+		MultiPlan *multiPlan = scanState->multiPlan;
+		Job *workerJob = multiPlan->workerJob;
+
+		PrepareMasterJobDirectory(workerJob);
+		MultiTaskTrackerExecute(workerJob);
 
 		LoadTuplesIntoTupleStore(scanState, workerJob);
 

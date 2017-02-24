@@ -74,7 +74,6 @@ bool EnableDeadlockPrevention = true;
 
 /* functions needed during run phase */
 static void ReacquireMetadataLocks(List *taskList);
-static bool IsModificationPlan(MultiPlan *multiPlan);
 static void ExecuteSingleModifyTask(CitusScanState *scanState, Task *task,
 									bool expectResults);
 static void ExecuteSingleSelectTask(CitusScanState *scanState, Task *task);
@@ -408,7 +407,7 @@ RequiresConsistentSnapshot(Task *task)
 
 
 void
-RouterBeginScan(CustomScanState *node, EState *estate, int eflags)
+CitusModifyBeginScan(CustomScanState *node, EState *estate, int eflags)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	MultiPlan *multiPlan = scanState->multiPlan;
@@ -432,7 +431,34 @@ RouterBeginScan(CustomScanState *node, EState *estate, int eflags)
 
 
 TupleTableSlot *
-RouterExecScan(CustomScanState *node)
+RouterModificationExecScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+	TupleTableSlot *resultSlot = NULL;
+
+	if (!scanState->finishedRemoteScan)
+	{
+		MultiPlan *multiPlan = scanState->multiPlan;
+		bool sendTuples = multiPlan->hasReturning;
+		Job *workerJob = multiPlan->workerJob;
+		List *taskList = workerJob->taskList;
+		Task *task = (Task *) linitial(taskList);
+
+		ProcessMasterEvaluableFunctions(workerJob);
+
+		ExecuteSingleModifyTask(scanState, task, sendTuples);
+
+		scanState->finishedRemoteScan = true;
+	}
+
+	resultSlot = ReadNextTuple(scanState);
+
+	return resultSlot;
+}
+
+
+TupleTableSlot *
+RouterSelectExecScan(CustomScanState *node)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	TupleTableSlot *resultSlot = NULL;
@@ -442,36 +468,42 @@ RouterExecScan(CustomScanState *node)
 		MultiPlan *multiPlan = scanState->multiPlan;
 		Job *workerJob = multiPlan->workerJob;
 		List *taskList = workerJob->taskList;
-		bool isModificationQuery = IsModificationPlan(multiPlan);
+		Task *task = (Task *) linitial(taskList);
 
 		ProcessMasterEvaluableFunctions(workerJob);
 
-		if (list_length(taskList) == 1)
-		{
-			Task *task = (Task *) linitial(taskList);
+		ExecuteSingleSelectTask(scanState, task);
 
-			if (isModificationQuery)
-			{
-				bool sendTuples = multiPlan->hasReturning;
-				ExecuteSingleModifyTask(scanState, task, sendTuples);
-			}
-			else
-			{
-				ExecuteSingleSelectTask(scanState, task);
-			}
-		}
-		else
-		{
-			bool sendTuples = multiPlan->hasReturning;
-			ExecuteMultipleTasks(scanState, taskList, isModificationQuery,
-								 sendTuples);
-		}
-
-		/* mark underlying query as having executed */
 		scanState->finishedRemoteScan = true;
 	}
 
-	/* if the underlying query produced output, return it */
+	resultSlot = ReadNextTuple(scanState);
+
+	return resultSlot;
+}
+
+
+TupleTableSlot *
+RouterMultipleTasksExecScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+	TupleTableSlot *resultSlot = NULL;
+
+	if (!scanState->finishedRemoteScan)
+	{
+		MultiPlan *multiPlan = scanState->multiPlan;
+		bool isModificationQuery = IsModificationPlan(multiPlan);
+		bool sendTuples = multiPlan->hasReturning;
+		Job *workerJob = multiPlan->workerJob;
+		List *taskList = workerJob->taskList;
+
+		ProcessMasterEvaluableFunctions(workerJob);
+
+		ExecuteMultipleTasks(scanState, taskList, isModificationQuery, sendTuples);
+
+		scanState->finishedRemoteScan = true;
+	}
+
 	resultSlot = ReadNextTuple(scanState);
 
 	return resultSlot;
@@ -492,7 +524,7 @@ ProcessMasterEvaluableFunctions(Job *workerJob)
 }
 
 
-static bool
+bool
 IsModificationPlan(MultiPlan *multiPlan)
 {
 	bool isModificationQuery = false;
