@@ -31,9 +31,25 @@
 
 
 static List *relationRestrictionContextList = NIL;
-static CustomScanMethods CitusCustomScanMethods = {
-	"CitusScan",
-	CitusCreateScan
+
+static CustomScanMethods RouterCustomScanMethods = {
+	"Citus Router",
+	RouterCreateScan
+};
+
+static CustomScanMethods RealTimeCustomScanMethods = {
+	"Citus Real-Time",
+	RealTimeCreateScan
+};
+
+static CustomScanMethods TaskTrackerCustomScanMethods = {
+	"Citus Task-Tracker",
+	TaskTrackerCreateScan
+};
+
+static CustomScanMethods InvalidCustomScanMethods = {
+	"Citus Invalid",
+	InvalidCreateScan
 };
 
 
@@ -306,7 +322,6 @@ GetMultiPlan(CustomScan *customScan)
 	MultiPlan *multiPlan = NULL;
 
 	Assert(IsA(customScan, CustomScan));
-	Assert(customScan->methods == &CitusCustomScanMethods);
 	Assert(list_length(customScan->custom_private) == 1);
 
 	multiPlan = DeSerializeMultiPlan(linitial(customScan->custom_private));
@@ -372,9 +387,43 @@ CreateFinalPlan(PlannedStmt *localPlan, MultiPlan *multiPlan)
 {
 	PlannedStmt *finalPlan = NULL;
 	CustomScan *customScan = makeNode(CustomScan);
-	Node *multiPlanData = SerializeMultiPlan(multiPlan);
+	Node *multiPlanData = NULL;
+	MultiExecutorType executorType = MULTI_EXECUTOR_INVALID_FIRST;
 
-	customScan->methods = &CitusCustomScanMethods;
+	if (!multiPlan->planningError)
+	{
+		executorType = JobExecutorType(multiPlan);
+	}
+
+	switch (executorType)
+	{
+		case MULTI_EXECUTOR_REAL_TIME:
+		{
+			customScan->methods = &RealTimeCustomScanMethods;
+			break;
+		}
+
+		case MULTI_EXECUTOR_TASK_TRACKER:
+		{
+			customScan->methods = &TaskTrackerCustomScanMethods;
+			break;
+		}
+
+		case MULTI_EXECUTOR_ROUTER:
+		{
+			customScan->methods = &RouterCustomScanMethods;
+			break;
+		}
+
+		default:
+		{
+			customScan->methods = &InvalidCustomScanMethods;
+			break;
+		}
+	}
+
+	multiPlanData = SerializeMultiPlan(multiPlan);
+
 	customScan->custom_private = list_make1(multiPlanData);
 	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
 

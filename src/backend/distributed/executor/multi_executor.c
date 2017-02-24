@@ -91,44 +91,85 @@ static Relation FauxRelation(TupleDesc tupleDescriptor);
 
 
 Node *
-CitusCreateScan(CustomScan *scan)
+RouterCreateScan(CustomScan *scan)
 {
 	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
+	MultiPlan *multiPlan = NULL;
+	Job *workerJob = NULL;
+	List *taskList = NIL;
+
+	scanState->executorType = MULTI_EXECUTOR_ROUTER;
 	scanState->customScanState.ss.ps.type = T_CustomScanState;
 	scanState->multiPlan = GetMultiPlan(scan);
-	scanState->executorType = JobExecutorType(scanState->multiPlan);
 
-	if (scanState->executorType == MULTI_EXECUTOR_ROUTER)
+	multiPlan = scanState->multiPlan;
+	workerJob = multiPlan->workerJob;
+	taskList = workerJob->taskList;
+
+	if (list_length(taskList) == 1)
 	{
-		MultiPlan *multiPlan = scanState->multiPlan;
-		Job *workerJob = multiPlan->workerJob;
-		List *taskList = workerJob->taskList;
 		bool isModificationQuery = IsModificationPlan(multiPlan);
-
-		if (list_length(taskList) == 1)
+		if (isModificationQuery)
 		{
-			if (isModificationQuery)
-			{
-				scanState->customScanState.methods = &RouterModificationCustomExecMethods;
-			}
-			else
-			{
-				scanState->customScanState.methods = &RouterSelectCustomExecMethods;
-			}
+			scanState->customScanState.methods = &RouterModificationCustomExecMethods;
 		}
 		else
 		{
-			scanState->customScanState.methods = &RouterMultipleTasksCustomExecMethods;
+			scanState->customScanState.methods = &RouterSelectCustomExecMethods;
 		}
 	}
-	else if (scanState->executorType == MULTI_EXECUTOR_REAL_TIME)
+	else
 	{
-		scanState->customScanState.methods = &RealTimeCustomExecMethods;
+		scanState->customScanState.methods = &RouterMultipleTasksCustomExecMethods;
 	}
-	else if (scanState->executorType == MULTI_EXECUTOR_TASK_TRACKER)
-	{
-		scanState->customScanState.methods = &TaskTrackerCustomExecMethods;
-	}
+
+	return (Node *) scanState;
+}
+
+
+Node *
+RealTimeCreateScan(CustomScan *scan)
+{
+	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
+
+	scanState->executorType = MULTI_EXECUTOR_REAL_TIME;
+	scanState->customScanState.ss.ps.type = T_CustomScanState;
+	scanState->multiPlan = GetMultiPlan(scan);
+
+	scanState->customScanState.methods = &RealTimeCustomExecMethods;
+
+	return (Node *) scanState;
+}
+
+
+Node *
+TaskTrackerCreateScan(CustomScan *scan)
+{
+	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
+
+	scanState->executorType = MULTI_EXECUTOR_TASK_TRACKER;
+	scanState->customScanState.ss.ps.type = T_CustomScanState;
+	scanState->multiPlan = GetMultiPlan(scan);
+
+	scanState->customScanState.methods = &TaskTrackerCustomExecMethods;
+
+	return (Node *) scanState;
+}
+
+
+Node *
+InvalidCreateScan(CustomScan *scan)
+{
+	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
+
+	scanState->executorType = MULTI_EXECUTOR_INVALID_FIRST;
+	scanState->customScanState.ss.ps.type = T_CustomScanState;
+	scanState->multiPlan = GetMultiPlan(scan);
+
+	Assert(IsA(scanState, CustomScanState));
+
+	/* ensure plan is executable */
+	VerifyMultiPlanValidity(scanState->multiPlan);
 
 	return (Node *) scanState;
 }

@@ -34,7 +34,10 @@ typedef struct CitusScanState
 	Tuplestorestate *tuplestorestate; /* tuple store to keep distributed results */
 } CitusScanState;
 
-Node * CitusCreateScan(CustomScan *scan);
+extern Node * RouterCreateScan(CustomScan *scan);
+extern Node * RealTimeCreateScan(CustomScan *scan);
+extern Node * TaskTrackerCreateScan(CustomScan *scan);
+extern Node * InvalidCreateScan(CustomScan *scan);
 extern void CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags);
 extern TupleTableSlot * RealTimeExecScan(CustomScanState *node);
 extern TupleTableSlot * TaskTrackerExecScan(CustomScanState *node);
@@ -42,7 +45,6 @@ extern void CitusEndScan(CustomScanState *node);
 extern void CitusReScan(CustomScanState *node);
 extern void CitusExplainScan(CustomScanState *node, List *ancestors,
 							 struct ExplainState *es);
-extern char * ExecutorName(MultiExecutorType executorType);
 extern void ValidateCitusScanState(CustomScanState *node);
 extern TupleTableSlot * ReadNextTuple(CitusScanState *scanState);
 

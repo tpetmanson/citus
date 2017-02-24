@@ -90,7 +90,6 @@ CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	MultiPlan *multiPlan = scanState->multiPlan;
-	const char *executorName = ExecutorName(scanState->executorType);
 
 	if (!ExplainDistributedQueries)
 	{
@@ -102,46 +101,9 @@ CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es
 
 	ExplainOpenGroup("Distributed Query", "Distributed Query", true, es);
 
-	ExplainPropertyText("Executor", executorName, es);
 	ExplainJob(multiPlan->workerJob, es);
 
 	ExplainCloseGroup("Distributed Query", "Distributed Query", true, es);
-}
-
-
-char *
-ExecutorName(MultiExecutorType executorType)
-{
-	char *executorName = NULL;
-
-	switch (executorType)
-	{
-		case MULTI_EXECUTOR_ROUTER:
-		{
-			executorName = "Router";
-		}
-		break;
-
-		case MULTI_EXECUTOR_REAL_TIME:
-		{
-			executorName = "Real-Time";
-		}
-		break;
-
-		case MULTI_EXECUTOR_TASK_TRACKER:
-		{
-			executorName = "Task-Tracker";
-		}
-		break;
-
-		default:
-		{
-			executorName = "Other";
-		}
-		break;
-	}
-
-	return executorName;
 }
 
 
